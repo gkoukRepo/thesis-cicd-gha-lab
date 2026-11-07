@@ -1,0 +1,35 @@
+# ΠΡΩΤΕΥΟΝ — συμπλήρωμα του probe-exitcode (εκκρεμότητα #6): ΜΟΝΟ job-level `continue-on-error`,
+# ώστε το conclusion του run να ΜΗΝ επηρεάζεται από άλλα jobs (στο probe-exitcode το job `default`
+# αποτυγχάνει σκόπιμα και «χρωματίζει» το run). Επιπλέον downstream job (`needs`) για να φανεί αν
+# εκτελείται και τι τιμή βλέπει στο `needs.<job>.result`.
+# Αποτελέσματα: jobs API + log (συλλογή: run.sh collect-supp).
+name: probe-exitcode-jobcontinue
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  GL_IMG: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+jobs:
+  job-continue:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ci/payload.sh
+      - name: gitleaks (job-level continue-on-error)
+        run: docker run --rm -v "$PWD:/w" -w /w "$GL_IMG" detect --source app --no-git --no-banner
+      - name: probe-reached-after-scanner
+        run: echo probe-reached-after-scanner
+  downstream:
+    needs: job-continue
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: probe-downstream
+        env:
+          RESULT: ${{ needs.job-continue.result }}
+        run: echo "probe-downstream needs.job-continue.result=$RESULT"
