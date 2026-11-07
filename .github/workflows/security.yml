@@ -1,0 +1,198 @@
+# thesis-security — GitHub Actions (github.com, GitHub-hosted runner, free tier).
+# Δύο επίπεδα evidence (CLAUDE.md §2):
+#   toolbaseline = CONTROL: ίδια canonical εργαλεία/images/digests με SYS=local & jenkins (ci/pins.env).
+#   native       = ΠΡΩΤΕΥΟΝ: CodeQL (code scanning), artifact digest (upload/download), artifact attestations.
+# Χειρισμός exit codes: `continue-on-error` (σύνταξη workflow = core της πλατφόρμας) → allow + καταγραφή.
+# Κάθε `uses:` είναι καρφωμένο σε commit SHA (first-party actions του GitHub — βλ. README για ταξινόμηση).
+name: thesis-security
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      D:
+        description: "Ημερομηνία evidence (YYYY-MM-DD)· κενό = σημερινή (UTC)"
+        required: false
+        default: ""
+permissions:
+  contents: read
+concurrency:
+  group: thesis-security
+  cancel-in-progress: false
+env:
+  SYS: githubactions
+
+jobs:
+  toolbaseline:
+    name: toolbaseline (CONTROL) + artifact integrity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write       # OIDC token → Sigstore (attestations)
+      attestations: write
+    services:
+      juice:                # native service container (στόχος ZAP) — ίδιο image by digest
+        image: bkimminich/juice-shop@sha256:cea5a4af4aacee498c491491af0408934ec81d004035c0a02ef3e54395e3bf27
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      d: ${{ steps.payload.outputs.d }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Payload (pinned)
+        id: payload
+        env:
+          IN_D: ${{ inputs.D }}
+        run: |
+          D="${IN_D:-$(date -u +%F)}"
+          echo "D=$D" >> "$GITHUB_ENV"; echo "d=$D" >> "$GITHUB_OUTPUT"
+          ci/payload.sh --image
+          mkdir -p evidence && : > "evidence/exitcodes_${SYS}_${D}.txt"
+      - name: Trivy image
+        id: trivy
+        continue-on-error: true
+        run: ci/scan.sh trivy
+      - name: Trivy fs
+        id: trivyfs
+        continue-on-error: true
+        run: ci/scan.sh trivyfs
+      - name: Grype
+        id: grype
+        continue-on-error: true
+        run: ci/scan.sh grype
+      - name: GitLeaks
+        id: gitleaks
+        continue-on-error: true
+        run: ci/scan.sh gitleaks
+      - name: Semgrep
+        id: semgrep
+        continue-on-error: true
+        run: ci/scan.sh semgrep
+      - name: Checkov (.github/workflows)
+        id: checkov
+        continue-on-error: true
+        run: ci/scan.sh checkov
+      - name: ZAP baseline (→ service container juice)
+        id: zap
+        continue-on-error: true
+        env:
+          ZAP_NET: ${{ job.services.juice.network }}
+        run: |
+          for i in $(seq 1 60); do
+            docker run --rm --network "$ZAP_NET" curlimages/curl@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b \
+              -sf http://juice:3000 >/dev/null 2>&1 && break
+            sleep 3
+          done
+          ci/scan.sh zap
+      - name: Tool/DB/runner versions (in-run)
+        if: always()
+        run: ci/versions.sh
+      - name: Step outcomes (native exit-code handling record)
+        if: always()
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: printf '%s\n' "$STEPS_JSON" > "evidence/steps-outcomes_${SYS}_${D}.json"
+      - name: Upload evidence (artifact digest = SHA-256)
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-githubactions
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Artifact attestation (SLSA build provenance, Sigstore)
+        id: attest
+        if: always()
+        continue-on-error: true    # σε private repo free tier → αναμένεται άρνηση (καταγράφεται)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: evidence/*
+      - name: Attestation outcome record
+        if: always()
+        env:
+          ATT_OUTCOME: ${{ steps.attest.outcome }}
+          ATT_ID: ${{ steps.attest.outputs.attestation-id }}
+          ATT_URL: ${{ steps.attest.outputs.attestation-url }}
+          UP_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          UP_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          echo "attest_outcome=$ATT_OUTCOME attestation_id=$ATT_ID attestation_url=$ATT_URL"
+          echo "upload_artifact_id=$UP_ID upload_artifact_digest=$UP_DIGEST"
+
+  artifact-verify:
+    name: artifact integrity (download digest check)
+    needs: toolbaseline
+    if: always() && needs.toolbaseline.outputs.artifact-id != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download (digest-mismatch = error)
+        id: dl
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.toolbaseline.outputs.artifact-id }}
+          path: dl
+          digest-mismatch: error
+      - name: Record
+        env:
+          EXPECTED: ${{ needs.toolbaseline.outputs.artifact-digest }}
+          D: ${{ needs.toolbaseline.outputs.d }}
+          DL_OUTCOME: ${{ steps.dl.outcome }}
+        run: |
+          mkdir -p out
+          ( cd dl && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > "out/artifact-verify-sha256_${SYS}_${D}.txt"
+          jq -n --arg exp "$EXPECTED" --arg o "$DL_OUTCOME" --arg n "$(find dl -type f | wc -l)" \
+            '{upload_artifact_digest:$exp, download_step_outcome:$o, digest_mismatch_policy:"error", files:($n|tonumber)}' \
+            > "out/artifact-verify_${SYS}_${D}.json"
+          cat "out/artifact-verify_${SYS}_${D}.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: artifact-verify-githubactions
+          path: out/
+
+  codeql:
+    name: native — CodeQL (code scanning)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Payload (pinned)
+        run: ci/payload.sh
+      - name: CodeQL init (javascript-typescript, build-mode none, source-root=app)
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          source-root: app
+      - name: CodeQL analyze
+        id: analyze
+        continue-on-error: true    # upload SARIF σε private repo χωρίς Code Security → αναμένεται άρνηση (καταγράφεται)
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: thesis-juice-shop
+          output: sarif-out
+          upload: always
+      - name: Record outcome
+        if: always()
+        env:
+          OUTCOME: ${{ steps.analyze.outcome }}
+          SARIF_ID: ${{ steps.analyze.outputs.sarif-id }}
+        run: |
+          mkdir -p sarif-out
+          jq -n --arg o "$OUTCOME" --arg s "$SARIF_ID" '{analyze_outcome:$o, sarif_id:$s}' > sarif-out/codeql-outcome.json
+          cat sarif-out/codeql-outcome.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: codeql-sarif-githubactions
+          path: sarif-out/

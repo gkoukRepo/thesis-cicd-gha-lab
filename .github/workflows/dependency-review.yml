@@ -1,0 +1,37 @@
+# native — Dependency Review (σε pull_request: αλλαγές εξαρτήσεων base→head + γνωστές ευπάθειες).
+# Λειτουργεί ΜΟΝΟ αν ο dependency graph του repo «βλέπει» manifests → βλ. README (απόφαση: PR με τα
+# manifests του φορτίου). Το αποτέλεσμα (outputs JSON) σώζεται ως artifact· το exit της action καταγράφεται.
+name: dependency-review
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  dependency-review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Dependency Review
+        id: dr
+        continue-on-error: true    # private repo χωρίς Code Security → αναμένεται άρνηση (καταγράφεται)
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          comment-summary-in-pr: never
+      - name: Record outputs
+        if: always()
+        env:
+          OUTCOME: ${{ steps.dr.outcome }}
+          CHANGES: ${{ steps.dr.outputs.dependency-changes }}
+          VULN: ${{ steps.dr.outputs.vulnerable-changes }}
+        run: |
+          mkdir -p out
+          printf '%s' "${CHANGES:-null}" > out/changes.json
+          printf '%s' "${VULN:-null}" > out/vuln.json
+          jq -n --arg o "$OUTCOME" --slurpfile c out/changes.json --slurpfile v out/vuln.json \
+            '{outcome:$o, dependency_changes:$c[0], vulnerable_changes:$v[0]}' > out/dependency-review.json
+          jq '{outcome, n_changes:(.dependency_changes|length? // null), n_vulnerable:(.vulnerable_changes|length? // null)}' out/dependency-review.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: dependency-review-githubactions
+          path: out/dependency-review.json
